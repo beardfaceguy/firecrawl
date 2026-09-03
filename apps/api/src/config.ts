@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { randomBytes } from "node:crypto";
 
 /* Codecs */
 const delimitedList = (separator = ",") => {
@@ -45,7 +46,12 @@ const configSchema = z.object({
   EXPRESS_TRUST_PROXY: z.coerce.number().optional(),
 
   // API Keys & Authentication
-  BULL_AUTH_KEY: z.string().optional(),
+  // Keep administrative routes unguessable when no deployment secret is set.
+  BULL_AUTH_KEY: z
+    .string()
+    .trim()
+    .min(32, "BULL_AUTH_KEY must be at least 32 characters")
+    .default(() => randomBytes(32).toString("hex")),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().optional(),
   OPENROUTER_API_KEY: z.string().optional(),
