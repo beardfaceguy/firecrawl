@@ -108,6 +108,38 @@ if err != nil {
 fmt.Println(doc.Video)
 ```
 
+### Product Extraction
+
+Use the `product` format on product pages for structured product extraction
+(title, price, availability, variants). The result is returned on the document's
+`Product` field. This is the deterministic counterpart to the LLM-based `json` format.
+
+```go
+doc, err := client.Scrape(ctx, "https://example.com/products/widget", &firecrawl.ScrapeOptions{
+	Formats: []string{"product"},
+})
+if err != nil {
+	return err
+}
+fmt.Println(doc.Product)
+```
+
+### Menu Extraction
+
+Use the `menu` format on menu pages for structured menu extraction
+(merchant, sections, items, prices, availability). The result is returned on the
+document's `Menu` field. This is the deterministic counterpart to the LLM-based `json` format.
+
+```go
+doc, err := client.Scrape(ctx, "https://example.com/menu", &firecrawl.ScrapeOptions{
+	Formats: []string{"menu"},
+})
+if err != nil {
+	return err
+}
+fmt.Println(doc.Menu)
+```
+
 #### Interactive Browser
 
 Execute code in a scrape-bound browser session:
@@ -126,7 +158,7 @@ deleteResp, err := client.StopInteractiveBrowser(ctx, scrapeJobID)
 
 Upload a local file (`html`, `pdf`, `docx`, etc.) via multipart form data and
 parse it synchronously. Parse options intentionally exclude browser-only
-features such as change tracking, screenshot, branding, audio, video, actions,
+features such as change tracking, screenshot, branding, product, menu, audio, video, actions,
 waitFor, location, and mobile. The `Proxy` option only accepts `"auto"` or `"basic"`.
 
 ```go
@@ -141,6 +173,16 @@ doc, err := client.Parse(ctx, file, &firecrawl.ParseOptions{
 	Formats: []string{"markdown"},
 })
 fmt.Println(doc.Markdown)
+```
+
+List the input formats the parse endpoint accepts. `Available` is `false` when
+a format is supported but disabled on the deployment (for example, image OCR).
+
+```go
+formats, err := client.GetParseFormats(ctx)
+for _, f := range formats {
+	fmt.Println(f.Format, f.Kind, f.Extensions, f.MimeTypes, f.Available)
+}
 ```
 
 ### Crawl
@@ -253,6 +295,15 @@ resp, err := client.StartAgent(ctx, &firecrawl.AgentOptions{
 })
 status, err := client.GetAgentStatus(ctx, resp.ID)
 _, err = client.CancelAgent(ctx, resp.ID)
+
+// Let the agent use Exchange data providers connected to your team
+status, err = client.Agent(ctx, &firecrawl.AgentOptions{
+	Prompt: "Summarize the latest earnings for AAPL",
+	Exchange: &firecrawl.AgentExchangeOptions{
+		Enabled:  firecrawl.Bool(true),
+		Toolkits: &[]string{"your-provider-slug"},
+	},
+})
 ```
 
 ### Browser
@@ -394,3 +445,47 @@ Users pin via the semantic version suffix; they never reference the
 ## License
 
 MIT
+
+## Alexandria tools
+
+Requires the matching Alexandria API deployment and team access. Semantic discovery
+returns contracts alongside web results in `SearchData.Tools`:
+
+```go
+limit := 2
+result, err := client.Search(ctx, "podcast conversations about AI agents", &firecrawl.SearchOptions{
+    Sources: []interface{}{"web", "alexandria"},
+    Limit: &limit,
+})
+if err != nil {
+    return err
+}
+fmt.Println(result.Tools, result.Warning)
+```
+
+For progressive disclosure, Find Tools returns an item's next detail request and,
+when more results are available, a top-level next page request:
+
+```go
+found, err := client.FindTools(ctx, &firecrawl.FindToolsOptions{
+    Providers: []string{"particle"},
+    Limit: &limit,
+})
+if err != nil {
+    return err
+}
+fmt.Println(found.Items)
+if found.Next != nil {
+    page, err := client.ScrapeAlexandria(ctx, []firecrawl.AlexandriaCall{*found.Next}, nil)
+    if err != nil {
+        return err
+    }
+    fmt.Println(page.Alexandria)
+}
+```
+
+`ScrapeAlexandria` also executes selected tools through `/v2/scrape`. Inspect each
+result's `Error` and `CreditsCost`. It generates one request ID before retries;
+reuse `AlexandriaOptions.RequestID` for the identical payload after an uncertain
+outcome. Both results and `AlexandriaExecutionError` carry `RequestID`. Find Tools
+costs zero credits; selected tool execution uses the published price.

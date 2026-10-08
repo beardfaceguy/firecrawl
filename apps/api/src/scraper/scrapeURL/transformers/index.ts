@@ -3,6 +3,7 @@ import { Meta } from "..";
 import { Document } from "../../../controllers/v2/types";
 import { htmlTransform } from "../lib/removeUnwantedElements";
 import { extractLinks } from "../lib/extractLinks";
+import { isMarkdownContentType } from "../lib/extractLinksFromMarkdown";
 import { extractImages } from "../lib/extractImages";
 import { extractMetadata } from "../lib/extractMetadata";
 import {
@@ -10,15 +11,19 @@ import {
   performSummary,
   performCleanContent,
 } from "./llmExtract";
+import { performDeterministicJson } from "./deterministicJson";
 import { performQuery } from "./query";
-import { uploadScreenshot } from "./uploadScreenshot";
+import { performKnowledgeGraph } from "./knowledgeGraph";
 import { removeBase64Images } from "./removeBase64Images";
 import { performAgent } from "./agent";
 import { performAttributes } from "./performAttributes";
 
 import { deriveDiff } from "./diff";
 import { fetchAudio } from "./audio";
+import { fetchProduct } from "./product";
+import { fetchMenu } from "./menu";
 import { fetchVideo } from "./video";
+import { performRedactPII } from "./redactPII";
 import { useIndex, useSearchIndex } from "../../../services/index";
 import { sendDocumentToIndex } from "../engines/index/index";
 import { sendDocumentToSearchIndex } from "./sendToSearchIndex";
@@ -70,6 +75,15 @@ async function deriveHTMLFromRawHTML(
   return document;
 }
 
+function requireRawHtml(document: Document): string {
+  if (document.rawHtml === undefined) {
+    throw new Error(
+      "rawHtml is undefined -- this transformer is being called out of order",
+    );
+  }
+  return document.rawHtml;
+}
+
 async function deriveMarkdownFromHTML(
   meta: Meta,
   document: Document,
@@ -85,16 +99,26 @@ async function deriveMarkdownFromHTML(
   // - json format requires markdown (for LLM extraction)
   // - summary format requires markdown (for summarization)
   // - question/highlights/query formats require markdown (for page-level answers)
+  // - redactPII needs markdown as its source text (spans are markdown char offsets)
   const hasMarkdown = hasFormatOfType(meta.options.formats, "markdown");
   const hasChangeTracking = hasFormatOfType(
     meta.options.formats,
     "changeTracking",
   );
-  const hasJson = hasFormatOfType(meta.options.formats, "json");
+  // deterministicJson populates document.json just like json, so treat it the
+  // same here (derive markdown for it; keep the field it produced).
+  const hasJson =
+    hasFormatOfType(meta.options.formats, "json") ||
+    hasFormatOfType(meta.options.formats, "deterministicJson");
   const hasSummary = hasFormatOfType(meta.options.formats, "summary");
   const hasQuestion = hasFormatOfType(meta.options.formats, "question");
   const hasHighlights = hasFormatOfType(meta.options.formats, "highlights");
   const hasQuery = hasFormatOfType(meta.options.formats, "query");
+  const hasRedactPII = !!meta.options.redactPII;
+  const hasKnowledgeGraph = hasFormatOfType(
+    meta.options.formats,
+    "knowledgeGraph",
+  );
   if (
     !hasMarkdown &&
     !hasChangeTracking &&
@@ -103,28 +127,36 @@ async function deriveMarkdownFromHTML(
     !hasQuestion &&
     !hasHighlights &&
     !hasQuery &&
+    !hasRedactPII &&
+    !hasKnowledgeGraph &&
     !meta.options.onlyCleanContent
   ) {
     return document;
   }
 
-  // Skip markdown derivation if a postprocessor already set it
-  if (document.metadata.postprocessorsUsed?.length && document.markdown) {
+  // Skip markdown derivation if the engine or a postprocessor already set it.
+  if (document.markdown !== undefined) {
     meta.logger.debug(
-      "Skipping markdown derivation - postprocessor already set markdown",
+      "Skipping markdown derivation - document already has markdown",
       { postprocessorsUsed: document.metadata.postprocessorsUsed },
     );
     return document;
   }
 
-  if (document.metadata.contentType?.includes("application/json")) {
-    if (document.rawHtml === undefined) {
-      throw new Error(
-        "rawHtml is undefined -- this transformer is being called out of order",
-      );
-    }
+  // Media types are case-insensitive per RFC, so normalize before matching.
+  const contentType = document.metadata.contentType?.toLowerCase();
 
-    document.markdown = "```json\n" + document.rawHtml + "\n```";
+  if (contentType?.includes("application/json")) {
+    document.markdown = "```json\n" + requireRawHtml(document) + "\n```";
+    return document;
+  }
+
+  // text/plain responses (e.g. llms.txt) are already plain text/markdown.
+  // Running them through the HTML-to-markdown converter escapes markdown
+  // punctuation like "_", which corrupts underscores inside link URLs. Pass
+  // the raw body through untouched instead.
+  if (contentType?.includes("text/plain")) {
+    document.markdown = requireRawHtml(document);
     return document;
   }
 
@@ -171,7 +203,9 @@ async function deriveLinksFromHTML(
   meta: Meta,
   document: Document,
 ): Promise<Document> {
-  if (document.html === undefined) {
+  const isMarkdown = isMarkdownContentType(document.metadata.contentType);
+
+  if (document.html === undefined && !isMarkdown) {
     throw new Error(
       "html is undefined -- this transformer is being called out of order",
     );
@@ -197,12 +231,15 @@ async function deriveLinksFromHTML(
     return document;
   }
 
+  // Engines that carry markdown natively (exchange) put synthetic metadata in
+  // rawHtml, so the markdown field is the only place their links live.
   document.links = await extractLinks(
-    document.html,
+    isMarkdown ? (document.markdown ?? document.rawHtml ?? "") : document.html!,
     document.metadata.url ??
       document.metadata.sourceURL ??
       meta.rewrittenUrl ??
       meta.url,
+    document.metadata.contentType,
   );
 
   if (forwardToIndexer) {
@@ -311,6 +348,7 @@ async function deriveBrandingFromActions(
 function coerceFieldsToFormats(meta: Meta, document: Document): Document {
   const hasMarkdown = hasFormatOfType(meta.options.formats, "markdown");
   const hasRawHtml = hasFormatOfType(meta.options.formats, "rawHtml");
+  const hasRawBase64 = hasFormatOfType(meta.options.formats, "rawBase64");
   const hasHtml = hasFormatOfType(meta.options.formats, "html");
   const hasLinks = hasFormatOfType(meta.options.formats, "links");
   const hasImages = hasFormatOfType(meta.options.formats, "images");
@@ -318,10 +356,16 @@ function coerceFieldsToFormats(meta: Meta, document: Document): Document {
     meta.options.formats,
     "changeTracking",
   );
-  const hasJson = hasFormatOfType(meta.options.formats, "json");
+  // deterministicJson populates document.json just like json, so treat it the
+  // same here (derive markdown for it; keep the field it produced).
+  const hasJson =
+    hasFormatOfType(meta.options.formats, "json") ||
+    hasFormatOfType(meta.options.formats, "deterministicJson");
   const hasScreenshot = hasFormatOfType(meta.options.formats, "screenshot");
   const hasSummary = hasFormatOfType(meta.options.formats, "summary");
   const hasBranding = hasFormatOfType(meta.options.formats, "branding");
+  const hasProduct = hasFormatOfType(meta.options.formats, "product");
+  const hasMenu = hasFormatOfType(meta.options.formats, "menu");
   const hasQuestionFormat = hasFormatOfType(meta.options.formats, "question");
   const hasHighlightsFormat = hasFormatOfType(
     meta.options.formats,
@@ -329,6 +373,10 @@ function coerceFieldsToFormats(meta: Meta, document: Document): Document {
   );
   const hasLegacyQueryFormat = hasFormatOfType(meta.options.formats, "query");
   const hasAnswerFormat = hasQuestionFormat || hasLegacyQueryFormat;
+  const hasKnowledgeGraph = hasFormatOfType(
+    meta.options.formats,
+    "knowledgeGraph",
+  );
 
   if (!hasMarkdown && document.markdown !== undefined) {
     delete document.markdown;
@@ -343,6 +391,14 @@ function coerceFieldsToFormats(meta: Meta, document: Document): Document {
   } else if (hasRawHtml && document.rawHtml === undefined) {
     meta.logger.warn(
       "Request had format: rawHtml, but there was no rawHtml field in the result.",
+    );
+  }
+
+  if (!hasRawBase64 && document.rawBase64 !== undefined) {
+    delete document.rawBase64;
+  } else if (hasRawBase64 && document.rawBase64 === undefined) {
+    meta.logger.warn(
+      "Request had format: rawBase64, but there was no rawBase64 field in the result.",
     );
   }
 
@@ -465,6 +521,17 @@ function coerceFieldsToFormats(meta: Meta, document: Document): Document {
     );
   }
 
+  if (!hasKnowledgeGraph && document.knowledgeGraph !== undefined) {
+    meta.logger.warn(
+      "Removed knowledgeGraph from Document because it was not requested.",
+    );
+    delete document.knowledgeGraph;
+  } else if (hasKnowledgeGraph && document.knowledgeGraph === undefined) {
+    meta.logger.warn(
+      "Request had format knowledgeGraph, but no graph was produced.",
+    );
+  }
+
   if (!hasBranding && document.branding !== undefined) {
     meta.logger.warn(
       "Removed branding from Document because it wasn't in formats -- this indicates the engine returned unexpected data.",
@@ -474,6 +541,20 @@ function coerceFieldsToFormats(meta: Meta, document: Document): Document {
     meta.logger.warn(
       "Request had format branding, but there was no branding field in the result.",
     );
+  }
+
+  if (!hasProduct && document.product !== undefined) {
+    meta.logger.warn(
+      "Removed product from Document because it wasn't in formats -- this indicates the engine returned unexpected data.",
+    );
+    delete document.product;
+  }
+
+  if (!hasMenu && document.menu !== undefined) {
+    meta.logger.warn(
+      "Removed menu from Document because it wasn't in formats -- this indicates the engine returned unexpected data.",
+    );
+    delete document.menu;
   }
 
   const hasAudio = hasFormatOfType(meta.options.formats, "audio");
@@ -488,7 +569,14 @@ function coerceFieldsToFormats(meta: Meta, document: Document): Document {
   const hasVideo = hasFormatOfType(meta.options.formats, "video");
   if (!hasVideo && document.video !== undefined) {
     delete document.video;
-  } else if (hasVideo && document.video === undefined) {
+  }
+  if (!hasVideo && document.videos !== undefined) {
+    delete document.videos;
+  } else if (
+    hasVideo &&
+    document.video === undefined &&
+    document.videos === undefined
+  ) {
     meta.logger.warn(
       "Request had format: video, but there was no video field in the result.",
     );
@@ -553,16 +641,20 @@ const transformerStack: Transformer[] = [
   deriveHTMLFromRawHTML,
   deriveMarkdownFromHTML,
   performCleanContent,
+  performRedactPII,
   deriveLinksFromHTML,
   deriveImagesFromHTML,
   deriveBrandingFromActions,
   deriveMetadataFromRawHTML,
-  uploadScreenshot,
+  fetchProduct,
+  fetchMenu,
   ...(useIndex ? [sendDocumentToIndex] : []),
   ...(useSearchIndex ? [sendDocumentToSearchIndex] : []), // Add to search index for real-time search
   performLLMExtract,
+  performDeterministicJson,
   performSummary,
   performQuery,
+  performKnowledgeGraph,
   performAttributes,
   performAgent,
   removeBase64Images,
@@ -576,6 +668,16 @@ export async function executeTransformers(
   meta: Meta,
   document: Document,
 ): Promise<Document> {
+  if (meta.internalOptions.teamId === "sitemap") {
+    document.metadata.scrapeId = meta.id;
+    if (useIndex) document = await sendDocumentToIndex(meta, document);
+    return coerceFieldsToFormats(meta, document);
+  }
+
+  if (hasFormatOfType(meta.options.formats, "rawBase64")) {
+    return coerceFieldsToFormats(meta, document);
+  }
+
   const executions: [string, number][] = [];
 
   for (const transformer of transformerStack) {

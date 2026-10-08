@@ -1,11 +1,56 @@
 import { logger } from "../../lib/logger";
-import { supabase_rr_service } from "../supabase";
+import { eq, inArray } from "drizzle-orm";
+import { dbRr } from "../../db/connection";
+import * as schema from "../../db/schema";
+import { getValue, setValue } from "../redis";
 import { autumnClient } from "./client";
+import { CREDITS_FEATURE_ID } from "./autumn.service";
 
-const CREDITS_FEATURE_ID = "CREDITS";
-const TOKENS_PER_CREDIT = 15;
+export const TOKENS_PER_CREDIT = 15;
 const HISTORICAL_RANGE = "90d";
 const HISTORICAL_BIN_SIZE = "day";
+const DAY_MS = 24 * 60 * 60 * 1000;
+const HISTORICAL_WINDOW_MS = 90 * DAY_MS;
+
+// The historical/analytics aggregations below are bucketed by day (and
+// optionally grouped by API key), so Autumn has to walk raw events and their
+// cost scales with the team's event volume. That routinely takes several
+// seconds. The Autumn client's global 2s timeout is sized for the
+// latency-sensitive balance checks on the request hot path, and it is far too
+// tight here, so these calls override it per call.
+const HISTORICAL_AGGREGATE_TIMEOUT_MS = 15000;
+
+// Grouping by API key over the whole 90-day window does not finish inside that
+// timeout for teams with tens of millions of events in it, so the byApiKey
+// breakdown asks Autumn for fixed 7-day slices instead. A slice that ended
+// over a day ago no longer changes and is cached for as long as it can still
+// fall inside the window, so a warm request only asks Autumn for the slice
+// holding today (and, for a day after a slice boundary, the one before it).
+const BY_API_KEY_SLICE_MS = 7 * DAY_MS;
+const BY_API_KEY_SLICE_SETTLE_MS = DAY_MS;
+const BY_API_KEY_SLICE_CACHE_TTL_SECONDS = HISTORICAL_WINDOW_MS / 1000;
+const BY_API_KEY_SLICE_CONCURRENCY = 2;
+
+// Autumn's maximum. Its default of 9 folds every further key into one "Other"
+// group per day, which the response can only label "Unknown".
+const BY_API_KEY_MAX_GROUPS = 250;
+
+// Autumn limits event aggregates per customer per second, and a cold byApiKey
+// request makes one call per slice. A rate-limited slice waits and retries;
+// every other status fails the request as before.
+const BY_API_KEY_RATE_LIMIT_RETRY = {
+  retries: {
+    strategy: "backoff" as const,
+    backoff: {
+      initialInterval: 250,
+      maxInterval: 1000,
+      exponent: 2,
+      maxElapsedTime: 3000,
+    },
+    retryConnectionErrors: false,
+  },
+  retryCodes: ["429"],
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -13,7 +58,6 @@ const HISTORICAL_BIN_SIZE = "day";
 
 interface TeamBalance {
   remaining: number;
-  granted: number;
   planCredits: number;
   usage: number;
   unlimited: boolean;
@@ -26,13 +70,12 @@ interface TeamBalance {
 // ---------------------------------------------------------------------------
 
 async function lookupOrgId(teamId: string): Promise<string> {
-  const { data, error } = await supabase_rr_service
-    .from("teams")
-    .select("org_id")
-    .eq("id", teamId)
-    .single();
+  const [data] = await dbRr
+    .select({ org_id: schema.teams.org_id })
+    .from(schema.teams)
+    .where(eq(schema.teams.id, teamId))
+    .limit(1);
 
-  if (error) throw error;
   if (!data?.org_id) {
     throw new Error(`Missing org_id for team ${teamId}`);
   }
@@ -40,36 +83,36 @@ async function lookupOrgId(teamId: string): Promise<string> {
 }
 
 /**
- * Maps numeric API key IDs to their display names from the api_keys table.
- * Returns a map of id → name.  Unknown IDs are mapped to their string representation.
+ * Maps API key identifiers from Autumn events to their display names.
+ *
+ * Autumn returns whatever value was sent as `properties.apiKeyId`. Current
+ * code sends the numeric `api_keys.id`, but the 90-day aggregation window can
+ * still include legacy events tagged with opaque non-numeric values. Anything
+ * we can't resolve is labeled "Unknown" so the response never surfaces raw
+ * identifiers.
  */
 async function lookupApiKeyNames(
   apiKeyIds: string[],
 ): Promise<Record<string, string>> {
   const numericIds = apiKeyIds
     .map(id => Number(id))
-    .filter(n => !isNaN(n) && n > 0);
+    .filter(n => Number.isInteger(n) && n > 0);
 
   const nameMap: Record<string, string> = {};
 
   if (numericIds.length > 0) {
-    const { data } = await supabase_rr_service
-      .from("api_keys")
-      .select("id, name")
-      .in("id", numericIds);
+    const rows = await dbRr
+      .select({ id: schema.api_keys.id, name: schema.api_keys.name })
+      .from(schema.api_keys)
+      .where(inArray(schema.api_keys.id, numericIds));
 
-    if (data) {
-      for (const row of data) {
-        nameMap[String(row.id)] = row.name;
-      }
+    for (const row of rows) {
+      nameMap[String(row.id)] = row.name ?? "Unknown";
     }
   }
 
-  // Fall back to raw ID string for any keys not found
   for (const id of apiKeyIds) {
-    if (!nameMap[id]) {
-      nameMap[id] = id;
-    }
+    if (!nameMap[id]) nameMap[id] = "Unknown";
   }
 
   return nameMap;
@@ -123,23 +166,26 @@ function getGroupedCredits(entry: any): Record<string, number> | undefined {
   );
 }
 
+/** One day of credits used, keyed by the `apiKeyId` Autumn grouped on. */
+interface ApiKeyUsageDay {
+  period: number;
+  credits: Record<string, number>;
+}
+
 async function aggregateHistoricalPeriodsByApiKeyMonth(
-  list: any[],
+  days: ApiKeyUsageDay[],
 ): Promise<HistoricalPeriodByApiKey[]> {
   const monthApiKeyTotals = new Map<string, Map<string, number>>();
   const allApiKeyIds = new Set<string>();
 
-  for (const entry of list) {
-    const monthStart = toMonthStartIso(entry.period);
+  for (const day of days) {
+    const monthStart = toMonthStartIso(day.period);
     if (!monthStart) continue;
-
-    const grouped = getGroupedCredits(entry);
-    if (!grouped) continue;
 
     const monthTotals =
       monthApiKeyTotals.get(monthStart) ?? new Map<string, number>();
 
-    for (const [apiKeyId, creditsUsed] of Object.entries(grouped)) {
+    for (const [apiKeyId, creditsUsed] of Object.entries(day.credits)) {
       allApiKeyIds.add(apiKeyId);
       monthTotals.set(apiKeyId, (monthTotals.get(apiKeyId) ?? 0) + creditsUsed);
     }
@@ -158,13 +204,22 @@ async function aggregateHistoricalPeriodsByApiKeyMonth(
 
     if (!monthTotals) continue;
 
-    for (const [apiKeyId, creditsUsed] of [...monthTotals.entries()].sort(
-      ([a], [b]) => a.localeCompare(b),
+    // Collapse rows whose IDs resolve to the same display name (e.g. multiple
+    // unresolved IDs all show as "Unknown") so the response has one row per
+    // name per month.
+    const byName = new Map<string, number>();
+    for (const [apiKeyId, creditsUsed] of monthTotals) {
+      const name = nameMap[apiKeyId];
+      byName.set(name, (byName.get(name) ?? 0) + creditsUsed);
+    }
+
+    for (const [apiKey, creditsUsed] of [...byName.entries()].sort(([a], [b]) =>
+      a.localeCompare(b),
     )) {
       results.push({
         startDate,
         endDate,
-        apiKey: nameMap[apiKeyId],
+        apiKey,
         creditsUsed,
       });
     }
@@ -308,8 +363,7 @@ export async function getTeamBalance(
   }
 
   return {
-    remaining: creditBalance?.remaining ?? 0,
-    granted: creditBalance?.granted ?? 0,
+    remaining: signedRemaining(creditBalance),
     planCredits,
     usage: creditBalance?.usage ?? 0,
     unlimited: creditBalance?.unlimited ?? false,
@@ -318,6 +372,23 @@ export async function getTeamBalance(
       : null,
     periodEnd: periodEndEpoch ? new Date(periodEndEpoch).toISOString() : null,
   };
+}
+
+// Autumn caps `balance.remaining` at 0, so it can't surface negative balances
+// for teams in overage. `granted - usage` preserves the signed balance.
+function signedRemaining(
+  balance:
+    | {
+        granted?: number;
+        usage?: number;
+        remaining?: number;
+        unlimited?: boolean;
+      }
+    | undefined,
+): number {
+  if (!balance) return 0;
+  if (balance.unlimited === true) return balance.remaining ?? 0;
+  return (balance.granted ?? 0) - (balance.usage ?? 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -340,8 +411,11 @@ interface HistoricalPeriodByApiKey {
 /**
  * Fetches a team's historical credit usage across billing periods from Autumn.
  *
- * Uses `events.aggregate` with the last 90 days of daily usage and rolls those
- * daily totals into calendar-month buckets in API code.
+ * Scopes the aggregate to the team's Autumn entity so the response reflects
+ * only that team's usage, not the whole org. Uses `events.aggregate` with the
+ * last 90 days of daily usage and rolls those daily totals into calendar-month
+ * buckets in API code. A team with no entity (never provisioned) has no
+ * team-scoped usage, so we return an empty history rather than the org total.
  */
 export async function getTeamHistoricalUsage(
   teamId: string,
@@ -354,41 +428,191 @@ export async function getTeamHistoricalUsage(
 
   const orgId = await lookupOrgId(teamId);
 
-  // Try entity-scoped aggregate first, fall back to customer-level
   let response: any;
   try {
-    response = await autumnClient.events.aggregate({
-      customerId: orgId,
-      entityId: teamId,
-      featureId: CREDITS_FEATURE_ID,
-      range: HISTORICAL_RANGE,
-      binSize: HISTORICAL_BIN_SIZE,
-    });
+    response = await autumnClient.events.aggregate(
+      {
+        customerId: orgId,
+        entityId: teamId,
+        featureId: CREDITS_FEATURE_ID,
+        range: HISTORICAL_RANGE,
+        binSize: HISTORICAL_BIN_SIZE,
+      },
+      { timeoutMs: HISTORICAL_AGGREGATE_TIMEOUT_MS },
+    );
   } catch (err: any) {
     const status = err?.statusCode ?? err?.status ?? err?.response?.status;
     if (status !== 404) throw err;
-    // Entity not found — retry at customer level
-    response = await autumnClient.events.aggregate({
-      customerId: orgId,
-      featureId: CREDITS_FEATURE_ID,
-      range: HISTORICAL_RANGE,
-      binSize: HISTORICAL_BIN_SIZE,
-    });
+    // Entity not found — the team has no usage of its own to report.
+    return [];
   }
 
   return aggregateHistoricalPeriodsByMonth(response.list ?? []);
 }
 
+interface UsageSlice {
+  start: number;
+  end: number;
+}
+
+/**
+ * The fixed 7-day slices covering `[windowStart, now]`, oldest first. They
+ * are aligned to the Unix epoch rather than to the window, so a slice keeps
+ * the same bounds (and cache key) while the window slides over it.
+ */
+function byApiKeySlices(windowStart: number, now: number): UsageSlice[] {
+  const slices: UsageSlice[] = [];
+  let start =
+    Math.floor(windowStart / BY_API_KEY_SLICE_MS) * BY_API_KEY_SLICE_MS;
+  for (; start <= now; start += BY_API_KEY_SLICE_MS) {
+    slices.push({ start, end: start + BY_API_KEY_SLICE_MS });
+  }
+  return slices;
+}
+
+function sliceCacheKey(teamId: string, slice: UsageSlice): string {
+  return `historical-usage-by-api-key:v1:${teamId}:${slice.start}`;
+}
+
+function isApiKeyUsageDays(value: unknown): value is ApiKeyUsageDay[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      day =>
+        typeof day?.period === "number" &&
+        typeof day.credits === "object" &&
+        day.credits !== null &&
+        !Array.isArray(day.credits) &&
+        Object.values(day.credits).every(v => typeof v === "number"),
+    )
+  );
+}
+
+async function readCachedSlice(
+  teamId: string,
+  slice: UsageSlice,
+): Promise<ApiKeyUsageDay[] | null> {
+  try {
+    const cached = await getValue(sliceCacheKey(teamId, slice));
+    if (cached === null) return null;
+    const parsed = JSON.parse(cached);
+    if (isApiKeyUsageDays(parsed)) return parsed;
+    logger.warn("Ignoring malformed historical usage cache entry", {
+      teamId,
+      sliceStart: slice.start,
+    });
+  } catch (error) {
+    logger.warn("Failed to read historical usage cache", {
+      teamId,
+      sliceStart: slice.start,
+      error,
+    });
+  }
+  return null;
+}
+
+async function writeCachedSlice(
+  teamId: string,
+  slice: UsageSlice,
+  days: ApiKeyUsageDay[],
+): Promise<void> {
+  try {
+    await setValue(
+      sliceCacheKey(teamId, slice),
+      JSON.stringify(days),
+      BY_API_KEY_SLICE_CACHE_TTL_SECONDS,
+    );
+  } catch (error) {
+    logger.warn("Failed to cache historical usage slice", {
+      teamId,
+      sliceStart: slice.start,
+      error,
+    });
+  }
+}
+
+async function fetchApiKeyUsageSlice(
+  client: NonNullable<typeof autumnClient>,
+  orgId: string,
+  teamId: string,
+  slice: UsageSlice,
+  now: number,
+): Promise<ApiKeyUsageDay[]> {
+  const response: any = await client.events.aggregate(
+    {
+      customerId: orgId,
+      entityId: teamId,
+      featureId: CREDITS_FEATURE_ID,
+      customRange: { start: slice.start, end: Math.min(slice.end, now) },
+      binSize: HISTORICAL_BIN_SIZE,
+      groupBy: "properties.apiKeyId",
+      maxGroups: BY_API_KEY_MAX_GROUPS,
+    },
+    {
+      timeoutMs: HISTORICAL_AGGREGATE_TIMEOUT_MS,
+      ...BY_API_KEY_RATE_LIMIT_RETRY,
+    },
+  );
+
+  const days: ApiKeyUsageDay[] = [];
+  for (const entry of response?.list ?? []) {
+    const period = new Date(entry.period).getTime();
+    // A bin outside the slice belongs to its neighbour, which counts it.
+    if (!(period >= slice.start && period < slice.end)) continue;
+
+    const credits = getGroupedCredits(entry);
+    if (credits) days.push({ period, credits });
+  }
+  return days;
+}
+
+/**
+ * Runs `fn` over `items` with at most `limit` calls in flight, keeping the
+ * results in input order. After the first failure no further item is started,
+ * and that failure is what rejects.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  let failed = false;
+
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      const index = next++;
+      try {
+        results[index] = await fn(items[index]);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
+}
+
 /**
  * Fetches a team's historical credit usage grouped by API key from Autumn.
  *
- * Uses the last 90 days of daily usage plus `groupBy: "properties.apiKeyId"`
- * and rolls those daily totals into calendar-month buckets in API code.
+ * Covers the 90 days up to now, from the start of that UTC day, as daily
+ * usage grouped by `properties.apiKeyId`, and rolls those daily totals into
+ * calendar-month buckets in API code. The days come from 7-day slices (see
+ * `BY_API_KEY_SLICE_MS`): the slice holding today is always asked for live and
+ * first, so a team with no entity answers 404 there and gets an empty
+ * history; settled slices come from the cache when they can.
  */
 export async function getTeamHistoricalUsageByApiKey(
   teamId: string,
 ): Promise<HistoricalPeriodByApiKey[]> {
-  if (!autumnClient) {
+  const client = autumnClient;
+  if (!client) {
     throw new Error(
       "Autumn client is not configured (AUTUMN_SECRET_KEY missing)",
     );
@@ -396,29 +620,55 @@ export async function getTeamHistoricalUsageByApiKey(
 
   const orgId = await lookupOrgId(teamId);
 
-  let response: any;
+  const now = Date.now();
+  const windowStart =
+    Math.floor((now - HISTORICAL_WINDOW_MS) / DAY_MS) * DAY_MS;
+  const slices = byApiKeySlices(windowStart, now);
+  const currentSlice = slices[slices.length - 1];
+  const earlierSlices = slices.slice(0, -1);
+
+  let currentDays: ApiKeyUsageDay[];
   try {
-    response = await autumnClient.events.aggregate({
-      customerId: orgId,
-      entityId: teamId,
-      featureId: CREDITS_FEATURE_ID,
-      range: HISTORICAL_RANGE,
-      binSize: HISTORICAL_BIN_SIZE,
-      groupBy: "properties.apiKeyId",
-    });
+    currentDays = await fetchApiKeyUsageSlice(
+      client,
+      orgId,
+      teamId,
+      currentSlice,
+      now,
+    );
   } catch (err: any) {
     const status = err?.statusCode ?? err?.status ?? err?.response?.status;
     if (status !== 404) throw err;
-    response = await autumnClient.events.aggregate({
-      customerId: orgId,
-      featureId: CREDITS_FEATURE_ID,
-      range: HISTORICAL_RANGE,
-      binSize: HISTORICAL_BIN_SIZE,
-      groupBy: "properties.apiKeyId",
-    });
+    // Entity not found — the team has no usage of its own to report.
+    return [];
   }
 
-  return aggregateHistoricalPeriodsByApiKeyMonth(response.list ?? []);
+  const earlierDays = await mapWithConcurrency(
+    earlierSlices,
+    BY_API_KEY_SLICE_CONCURRENCY,
+    async slice => {
+      const settled = slice.end <= now - BY_API_KEY_SLICE_SETTLE_MS;
+      if (settled) {
+        const cached = await readCachedSlice(teamId, slice);
+        if (cached !== null) return cached;
+      }
+
+      const days = await fetchApiKeyUsageSlice(
+        client,
+        orgId,
+        teamId,
+        slice,
+        now,
+      );
+      if (settled) await writeCachedSlice(teamId, slice, days);
+      return days;
+    },
+  );
+
+  const days = [...earlierDays.flat(), ...currentDays].filter(
+    day => day.period >= windowStart,
+  );
+  return aggregateHistoricalPeriodsByApiKeyMonth(days);
 }
 
 /**

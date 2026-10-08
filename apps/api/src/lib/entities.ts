@@ -142,6 +142,7 @@ interface NewsSearchResult {
   metadata?: Record<string, any>;
   answer?: string;
   highlights?: string;
+  knowledgeGraph?: import("../scraper/scrapeURL/transformers/knowledgeGraphUtils").KnowledgeGraph;
 }
 
 export interface WebSearchResult {
@@ -159,14 +160,17 @@ export interface WebSearchResult {
   metadata?: Record<string, any>;
   answer?: string;
   highlights?: string;
+  knowledgeGraph?: import("../scraper/scrapeURL/transformers/knowledgeGraphUtils").KnowledgeGraph;
 }
 
 export type SearchResultType = "web" | "images" | "news";
 
 export interface SearchV2Response {
+  tools?: import("../services/alexandria/contracts").DiscoveredTool[];
   web?: WebSearchResult[];
   images?: ImageSearchResult[];
   news?: NewsSearchResult[];
+  knowledgeGraph?: import("../scraper/scrapeURL/transformers/knowledgeGraphUtils").KnowledgeGraph;
 }
 
 export interface ScrapeActionContent {

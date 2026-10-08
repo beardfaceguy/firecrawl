@@ -1,16 +1,33 @@
+import {
+  agentHintsMiddleware,
+  agentHintsProviderMiddleware,
+} from "../middlewares/agent-hints";
 import express from "express";
 import multer from "multer";
 import { config } from "../config";
 import { RateLimiterMode } from "../types";
+import { registerMcpActionLogReadRoute } from "./mcp-action-logs";
+import { SEARCH_CREDITS_FEATURE_ID } from "../services/autumn/autumn.service";
 import expressWs from "express-ws";
-import { searchController } from "../controllers/v2/search";
+import {
+  researchCategoryNoticeMiddleware,
+  searchController,
+} from "../controllers/v2/search";
+import { feedbackController } from "../controllers/v2/feedback/controller";
 import { searchFeedbackController } from "../controllers/v2/search-feedback";
-import { x402SearchController } from "../controllers/v2/x402-search";
 import { scrapeController } from "../controllers/v2/scrape";
+import { keylessEligibilityController } from "../controllers/v2/keyless-eligibility";
 import {
   parseController,
   parseMultipartPayloadMiddleware,
 } from "../controllers/v2/parse";
+import {
+  parseLocalUploadController,
+  parseLocalUploadStorageGuard,
+  parseUploadRefPayloadMiddleware,
+  parseUploadUrlController,
+} from "../controllers/v2/parse-upload";
+import { parseFormatsController } from "../controllers/v2/parse-formats";
 import { batchScrapeController } from "../controllers/v2/batch-scrape";
 import { crawlController } from "../controllers/v2/crawl";
 import { crawlParamsPreviewController } from "../controllers/v2/crawl-params-preview";
@@ -30,6 +47,7 @@ import {
   authMiddleware,
   checkCreditsMiddleware,
   blocklistMiddleware,
+  scrapeBlocklistMiddleware,
   countryCheck,
   idempotencyMiddleware,
   requestTimingMiddleware,
@@ -40,28 +58,43 @@ import {
 import { queueStatusController } from "../controllers/v2/queue-status";
 import { creditUsageHistoricalController } from "../controllers/v2/credit-usage-historical";
 import { tokenUsageHistoricalController } from "../controllers/v2/token-usage-historical";
-import {
-  paymentMiddleware,
-  getX402ResourceServer,
-  createX402RouteConfig,
-  isX402Enabled,
-} from "../lib/x402";
 import { deprecationMiddleware } from "../lib/deprecations";
+import { isResearchKeylessDisabled } from "../lib/research-keyless";
 import { agentController } from "../controllers/v2/agent";
 import { agentStatusController } from "../controllers/v2/agent-status";
 import { agentCancelController } from "../controllers/v2/agent-cancel";
+import { agentTraceController } from "../controllers/v2/agent-trace";
+import { agentSnapshotController } from "../controllers/v2/agent-snapshot";
+import { agentSkillController } from "../controllers/v2/agent-skill";
+import { agentThreadController } from "../controllers/v2/agent-thread";
 import {
+  browserProfileDeleteController,
   browserCreateController,
   browserExecuteController,
   browserDeleteController,
   browserListController,
-  browserWebhookDestroyedController,
+  browserReplayController,
+  browserReplayPageController,
+  browserStatusController,
 } from "../controllers/v2/browser";
 import { activityController } from "../controllers/v1/activity";
+import {
+  getTeamThreatProtectionController,
+  getTeamZscalerCategoriesController,
+  putTeamThreatProtectionController,
+  syncTeamZscalerController,
+  testTeamZscalerConnectionController,
+} from "../controllers/v2/team-threat-protection";
+import {
+  getTeamSiemLoggingController,
+  putTeamSiemLoggingController,
+  testTeamSiemLoggingController,
+} from "../controllers/v2/team-siem-logging";
 import { supportProxyController } from "../controllers/v2/support-proxy";
 import {
-  researchFlagMiddleware,
-  researchProxyController,
+  createDeveloperRouter,
+  createGovRouter,
+  createResearchRouter,
 } from "../controllers/v2/research-proxy";
 import {
   scrapeInteractController,
@@ -79,10 +112,18 @@ import {
   unsubscribeMonitorEmailController,
   updateMonitorController,
 } from "../controllers/v2/monitor";
-
-expressWs(express());
-
+import {
+  slackChannelsController,
+  slackCommandsController,
+  slackDisconnectController,
+  slackEventsController,
+  slackOAuthCallbackController,
+  slackOAuthStartController,
+  slackStatusController,
+} from "../controllers/v2/slack";
+import { agentListController } from "../controllers/v2/agent-list";
 export const v2Router = express.Router();
+expressWs(express()).applyTo(v2Router);
 
 const parseUpload = multer({
   storage: multer.memoryStorage(),
@@ -115,129 +156,52 @@ const parseUploadMiddleware: express.RequestHandler = (req, res, next) => {
   });
 };
 
+const parsePayloadMiddleware: express.RequestHandler = (req, res, next) => {
+  const contentType = req.headers["content-type"] || "";
+  if (
+    typeof contentType === "string" &&
+    contentType.includes("multipart/form-data")
+  ) {
+    return parseUploadMiddleware(req, res, err => {
+      if (err) return next(err);
+      return parseMultipartPayloadMiddleware(req, res, next);
+    });
+  }
+
+  if (req.body && typeof req.body === "object" && "uploadRef" in req.body) {
+    return parseUploadRefPayloadMiddleware(req as any, res, next);
+  }
+
+  return res.status(400).json({
+    success: false,
+    code: "BAD_REQUEST",
+    error:
+      "Missing file upload. Send multipart/form-data with a 'file' field, or JSON with an 'uploadRef'.",
+  });
+};
 // Add timing middleware to all v2 routes
 v2Router.use(requestTimingMiddleware("v2"));
 
-// Configure payment middleware to enable micropayment-protected endpoints
-// This middleware handles payment verification and processing for premium API features
-// x402 payments protocol - https://github.com/coinbase/x402
-// v2Router.use(
-//   paymentMiddleware(
-//     (config.X402_PAY_TO_ADDRESS as `0x${string}`) ||
-//       "0x0000000000000000000000000000000000000000",
-//     {
-//       "POST /x402/search": {
-//         price: config.X402_ENDPOINT_PRICE_USD as string,
-//         network: config.X402_NETWORK as
-//           | "base-sepolia"
-//           | "base"
-//           | "avalanche-fuji"
-//           | "avalanche"
-//           | "iotex",
-//         config: {
-//           discoverable: true,
-//           description:
-//             "The search endpoint combines web search (SERP) with Firecrawl's scraping capabilities to return full page content for any query. Requires micropayment via X402 protocol",
-//           mimeType: "application/json",
-//           maxTimeoutSeconds: 120,
-//           inputSchema: {
-//             body: {
-//               query: {
-//                 type: "string",
-//                 description: "Search query to find relevant web pages",
-//                 required: true,
-//               },
-//               sources: {
-//                 type: "array",
-//                 description: "Sources to search (web, news, images)",
-//                 required: false,
-//               },
-//               limit: {
-//                 type: "number",
-//                 description: "Maximum number of results to return (max 10)",
-//                 required: false,
-//               },
-//               scrapeOptions: {
-//                 type: "object",
-//                 description: "Options for scraping the found pages",
-//                 required: false,
-//               },
-//               asyncScraping: {
-//                 type: "boolean",
-//                 description: "Whether to return job IDs for async scraping",
-//                 required: false,
-//               },
-//             },
-//           },
-//           outputSchema: {
-//             type: "object",
-//             properties: {
-//               success: { type: "boolean" },
-//               data: {
-//                 type: "object",
-//                 properties: {
-//                   web: {
-//                     type: "array",
-//                     items: {
-//                       type: "object",
-//                       properties: {
-//                         url: { type: "string" },
-//                         title: { type: "string" },
-//                         description: { type: "string" },
-//                         markdown: { type: "string" },
-//                       },
-//                     },
-//                   },
-//                   news: {
-//                     type: "array",
-//                     items: {
-//                       type: "object",
-//                       properties: {
-//                         url: { type: "string" },
-//                         title: { type: "string" },
-//                         snippet: { type: "string" },
-//                         markdown: { type: "string" },
-//                       },
-//                     },
-//                   },
-//                   images: {
-//                     type: "array",
-//                     items: {
-//                       type: "object",
-//                       properties: {
-//                         url: { type: "string" },
-//                         title: { type: "string" },
-//                         markdown: { type: "string" },
-//                       },
-//                     },
-//                   },
-//                 },
-//               },
-//               scrapeIds: {
-//                 type: "object",
-//                 description:
-//                   "Job IDs for async scraping (if asyncScraping is true)",
-//                 properties: {
-//                   web: { type: "array", items: { type: "string" } },
-//                   news: { type: "array", items: { type: "string" } },
-//                   images: { type: "array", items: { type: "string" } },
-//                 },
-//               },
-//               creditsUsed: { type: "number" },
-//             },
-//           },
-//         },
-//       },
-//     },
-//     facilitator,
-//   ),
-// );
+// Internal: trusted-proxy (hosted MCP) keyless eligibility probe. Secret-gated
+// inside the controller; no auth middleware.
+v2Router.get("/keyless/eligibility", wrap(keylessEligibilityController));
+
+registerMcpActionLogReadRoute(
+  v2Router,
+  authMiddleware(RateLimiterMode.Account),
+);
 
 v2Router.post(
   "/search",
-  authMiddleware(RateLimiterMode.Search),
+  agentHintsMiddleware("search"),
+  researchCategoryNoticeMiddleware,
+  authMiddleware(RateLimiterMode.Search, {
+    allowKeyless: true,
+    allowAgentManagedKey: true,
+  }),
+  agentHintsProviderMiddleware("search"),
   countryCheck,
-  checkCreditsMiddleware(),
+  checkCreditsMiddleware(undefined, SEARCH_CREDITS_FEATURE_ID),
   blocklistMiddleware,
   wrap(searchController),
 );
@@ -250,21 +214,53 @@ v2Router.post(
 );
 
 v2Router.post(
-  "/parse",
-  authMiddleware(RateLimiterMode.Scrape),
+  "/feedback",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(feedbackController),
+);
+
+v2Router.get(
+  "/parse/formats",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(parseFormatsController),
+);
+
+v2Router.post(
+  "/parse/upload-url",
+  authMiddleware(RateLimiterMode.Scrape, { allowKeyless: true }),
   countryCheck,
-  parseUploadMiddleware,
-  parseMultipartPayloadMiddleware,
+  wrap(parseUploadUrlController),
+);
+
+v2Router.put(
+  "/parse/upload/:uploadId",
+  parseLocalUploadStorageGuard,
+  express.raw({ type: "*/*", limit: "50mb" }),
+  wrap(parseLocalUploadController),
+);
+
+v2Router.post(
+  "/parse",
+  agentHintsMiddleware("parse"),
+  authMiddleware(RateLimiterMode.Scrape, { allowKeyless: true }),
+  agentHintsProviderMiddleware("parse"),
+  countryCheck,
   checkCreditsMiddleware(1),
+  parsePayloadMiddleware,
   wrap(parseController),
 );
 
 v2Router.post(
   "/scrape",
-  authMiddleware(RateLimiterMode.Scrape),
+  agentHintsMiddleware("scrape"),
+  authMiddleware(RateLimiterMode.Scrape, {
+    allowKeyless: true,
+    allowAgentManagedKey: true,
+  }),
+  agentHintsProviderMiddleware("scrape"),
   countryCheck,
   checkCreditsMiddleware(1),
-  blocklistMiddleware,
+  scrapeBlocklistMiddleware,
   wrap(scrapeController),
 );
 
@@ -277,21 +273,21 @@ v2Router.get(
 
 v2Router.post(
   "/scrape/:jobId/interact",
-  authMiddleware(RateLimiterMode.BrowserExecute),
+  authMiddleware(RateLimiterMode.BrowserExecute, { allowKeyless: true }),
   validateJobIdParam,
   wrap(scrapeInteractController),
 );
 
 v2Router.delete(
   "/scrape/:jobId/interact",
-  authMiddleware(RateLimiterMode.BrowserExecute),
+  authMiddleware(RateLimiterMode.BrowserExecute, { allowKeyless: true }),
   validateJobIdParam,
   wrap(scrapeStopInteractiveBrowserController),
 );
 
 v2Router.post(
   "/batch/scrape",
-  authMiddleware(RateLimiterMode.Scrape),
+  authMiddleware(RateLimiterMode.Scrape, { allowAgentManagedKey: true }),
   countryCheck,
   checkCreditsMiddleware(),
   blocklistMiddleware,
@@ -300,7 +296,9 @@ v2Router.post(
 
 v2Router.post(
   "/map",
+  agentHintsMiddleware("map"),
   authMiddleware(RateLimiterMode.Map),
+  agentHintsProviderMiddleware("map"),
   checkCreditsMiddleware(1),
   blocklistMiddleware,
   wrap(mapController),
@@ -311,7 +309,7 @@ v2Router.post(
   authMiddleware(RateLimiterMode.Crawl),
   countryCheck,
   checkCreditsMiddleware(),
-  blocklistMiddleware,
+  scrapeBlocklistMiddleware,
   idempotencyMiddleware,
   wrap(crawlController),
 );
@@ -352,7 +350,11 @@ v2Router.delete(
 v2Router.ws(
   "/crawl/:jobId",
   ((ws: any, req: express.Request, next: (err?: unknown) => void) => {
-    if (!isValidJobId(req.params.jobId)) {
+    const jobId = Array.isArray(req.params.jobId)
+      ? undefined
+      : req.params.jobId;
+
+    if (!isValidJobId(jobId)) {
       ws.close(1008, "Invalid job ID");
       return;
     }
@@ -363,14 +365,14 @@ v2Router.ws(
 
 v2Router.get(
   "/batch/scrape/:jobId",
-  authMiddleware(RateLimiterMode.CrawlStatus),
+  authMiddleware(RateLimiterMode.CrawlStatus, { allowAgentManagedKey: true }),
   validateJobIdParam,
   wrap((req: any, res: any) => crawlStatusController(req, res, true)),
 );
 
 v2Router.delete(
   "/batch/scrape/:jobId",
-  authMiddleware(RateLimiterMode.CrawlStatus),
+  authMiddleware(RateLimiterMode.CrawlStatus, { allowAgentManagedKey: true }),
   validateJobIdParam,
   wrap(crawlCancelController),
 );
@@ -406,6 +408,19 @@ v2Router.get(
   wrap(extractStatusController),
 );
 
+v2Router.get(
+  "/agent",
+  authMiddleware(RateLimiterMode.ExtractStatus),
+  wrap(agentListController),
+);
+
+// Registered ahead of "/agent/:jobId" so a thread id is never read as a job id.
+v2Router.get(
+  "/agent/threads/:threadId",
+  authMiddleware(RateLimiterMode.ExtractStatus),
+  wrap(agentThreadController),
+);
+
 v2Router.post(
   "/agent",
   authMiddleware(RateLimiterMode.Extract),
@@ -420,6 +435,27 @@ v2Router.get(
   authMiddleware(RateLimiterMode.ExtractStatus),
   validateJobIdParam,
   wrap(agentStatusController),
+);
+
+v2Router.get(
+  "/agent/:jobId/trace",
+  authMiddleware(RateLimiterMode.ExtractStatus),
+  validateJobIdParam,
+  wrap(agentTraceController),
+);
+
+v2Router.get(
+  "/agent/:jobId/skill",
+  authMiddleware(RateLimiterMode.ExtractStatus),
+  validateJobIdParam,
+  wrap(agentSkillController),
+);
+
+v2Router.get(
+  "/agent/:jobId/snapshots/:snapshotId",
+  authMiddleware(RateLimiterMode.ExtractStatus),
+  validateJobIdParam,
+  wrap(agentSnapshotController),
 );
 
 v2Router.delete(
@@ -469,6 +505,54 @@ v2Router.get(
   "/team/activity",
   authMiddleware(RateLimiterMode.Account),
   wrap(activityController),
+);
+
+v2Router.get(
+  "/team/threat-protection",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(getTeamThreatProtectionController),
+);
+
+v2Router.put(
+  "/team/threat-protection",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(putTeamThreatProtectionController),
+);
+
+v2Router.post(
+  "/team/threat-protection/zscaler/test-connection",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(testTeamZscalerConnectionController),
+);
+
+v2Router.get(
+  "/team/threat-protection/zscaler/categories",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(getTeamZscalerCategoriesController),
+);
+
+v2Router.post(
+  "/team/threat-protection/zscaler/sync",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(syncTeamZscalerController),
+);
+
+v2Router.get(
+  "/team/siem",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(getTeamSiemLoggingController),
+);
+
+v2Router.put(
+  "/team/siem",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(putTeamSiemLoggingController),
+);
+
+v2Router.post(
+  "/team/siem/test",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(testTeamSiemLoggingController),
 );
 
 v2Router.post(
@@ -536,35 +620,83 @@ v2Router.get(
   wrap(getMonitorCheckController),
 );
 
+// Slack integration ("Add to Slack" + /monitor slash command).
+// Public endpoints (OAuth callback, slash command, events) authenticate via the
+// OAuth state nonce / Slack request signature rather than a Firecrawl API key.
 v2Router.post(
-  "/browser",
-  authMiddleware(RateLimiterMode.Browser),
+  "/slack/oauth/start",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(slackOAuthStartController),
+);
+v2Router.get("/slack/oauth/callback", wrap(slackOAuthCallbackController));
+v2Router.get(
+  "/slack/status",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(slackStatusController),
+);
+v2Router.get(
+  "/slack/channels",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(slackChannelsController),
+);
+v2Router.delete(
+  "/slack/installation",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(slackDisconnectController),
+);
+v2Router.post("/slack/commands", wrap(slackCommandsController));
+v2Router.post("/slack/events", wrap(slackEventsController));
+
+v2Router.post(
+  ["/browser", "/interact"],
+  authMiddleware(RateLimiterMode.Browser, { allowAgentManagedKey: true }),
   countryCheck,
   checkCreditsMiddleware(2),
   wrap(browserCreateController),
 );
 
 v2Router.get(
-  "/browser",
+  ["/browser", "/interact"],
   authMiddleware(RateLimiterMode.BrowserExecute),
   wrap(browserListController),
 );
 
 v2Router.post(
-  "/browser/:sessionId/execute",
+  ["/browser/:sessionId/execute", "/interact/:sessionId/execute"],
   authMiddleware(RateLimiterMode.BrowserExecute),
   wrap(browserExecuteController),
 );
 
+v2Router.get(
+  ["/browser/:sessionId/replay", "/interact/:sessionId/replay"],
+  authMiddleware(RateLimiterMode.BrowserReplay),
+  wrap(browserReplayController),
+);
+
+v2Router.get(
+  ["/browser/:sessionId/replay/:pageId", "/interact/:sessionId/replay/:pageId"],
+  authMiddleware(RateLimiterMode.BrowserReplay),
+  wrap(browserReplayPageController),
+);
+
 v2Router.delete(
-  "/browser/:sessionId",
+  ["/browser/profiles/:name", "/interact/profiles/:name"],
   authMiddleware(RateLimiterMode.BrowserExecute),
+  wrap(browserProfileDeleteController),
+);
+
+v2Router.delete(
+  ["/browser/:sessionId", "/interact/:sessionId"],
+  authMiddleware(RateLimiterMode.BrowserExecute, {
+    allowAgentManagedKey: true,
+  }),
   wrap(browserDeleteController),
 );
 
-v2Router.post(
-  "/browser/webhook/destroyed",
-  wrap(browserWebhookDestroyedController),
+v2Router.get(
+  ["/browser/:sessionId", "/interact/:sessionId"],
+  authMiddleware(RateLimiterMode.BrowserExecute),
+  wrap(browserStatusController),
 );
 
 // Support agent proxy — forwards to the support-agent service.
@@ -580,30 +712,42 @@ v2Router.post(
 );
 
 if (config.RESEARCH_PROXY_URL) {
-  v2Router.all(
-    "/research/*",
+  v2Router.use(
+    "/search/research",
+    authMiddleware(RateLimiterMode.Research, {
+      allowKeyless: req => !isResearchKeylessDisabled(req),
+    }),
+    createResearchRouter(),
+  );
+
+  v2Router.use(
+    "/research",
     authMiddleware(RateLimiterMode.Research),
-    researchFlagMiddleware,
-    wrap(researchProxyController),
+    createResearchRouter({ legacy: true }),
+  );
+
+  // Canonical: developer search is a subset of search, so it lives under it.
+  v2Router.use(
+    "/search/developer",
+    authMiddleware(RateLimiterMode.DeveloperSearch, { allowKeyless: true }),
+    createDeveloperRouter({ root: true }),
+  );
+
+  // Compatibility only: the pre-GA path. Published CLI and MCP builds still
+  // call it. Delete once those ship on /search/developer. Not documented.
+  v2Router.use(
+    "/developer",
+    authMiddleware(RateLimiterMode.DeveloperSearch),
+    createDeveloperRouter(),
   );
 }
 
-// Only register x402 routes if X402_PAY_TO_ADDRESS is configured
-if (isX402Enabled()) {
-  v2Router.post(
-    "/x402/search",
-    authMiddleware(RateLimiterMode.Search),
-    countryCheck,
-    blocklistMiddleware,
-    paymentMiddleware(
-      createX402RouteConfig(
-        "POST /x402/search",
-        "The search endpoint combines web search (SERP) with Firecrawl's scraping capabilities to return full page content for any query. Requires micropayment via X402 protocol",
-        {},
-        {},
-      ),
-      getX402ResourceServer(),
-    ),
-    wrap(x402SearchController),
+if (config.SEARCH_PLATFORM_URL) {
+  v2Router.use(
+    "/search/gov",
+    authMiddleware(RateLimiterMode.GovSearch, {
+      allowKeyless: true,
+    }),
+    createGovRouter(),
   );
 }

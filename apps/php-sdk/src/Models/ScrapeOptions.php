@@ -11,8 +11,9 @@ final class ScrapeOptions
      * @param array<string, string>|null   $headers
      * @param list<string>|null            $includeTags
      * @param list<string>|null            $excludeTags
-     * @param list<mixed>|null             $parsers
+     * @param list<string|PDFParser|array<string, mixed>>|null $parsers
      * @param list<array<string, mixed>>|null $actions
+     * @param AuditMetadata|null           $auditMetadata
      */
     private function __construct(
         private readonly ?array $formats = null,
@@ -38,6 +39,8 @@ final class ScrapeOptions
         /** @var array<string, string>|null */
         private readonly ?array $profile = null,
         private readonly ?bool $changeTracking = null,
+        private readonly ?bool $redactPII = null,
+        private readonly ?AuditMetadata $auditMetadata = null,
     ) {}
 
     /**
@@ -45,9 +48,10 @@ final class ScrapeOptions
      * @param array<string, string>|null                    $headers
      * @param list<string>|null                             $includeTags
      * @param list<string>|null                             $excludeTags
-     * @param list<mixed>|null                              $parsers
+     * @param list<string|PDFParser|array<string, mixed>>|null $parsers
      * @param list<array<string, mixed>>|null               $actions
      * @param array<string, string>|null                    $profile
+     * @param AuditMetadata|null                            $auditMetadata
      */
     public static function with(
         ?array $formats = null,
@@ -72,13 +76,15 @@ final class ScrapeOptions
         ?int $minAge = null,
         ?array $profile = null,
         ?bool $changeTracking = null,
+        ?bool $redactPII = null,
+        ?AuditMetadata $auditMetadata = null,
     ): self {
         return new self(
             $formats, $headers, $includeTags, $excludeTags, $onlyMainContent,
             $timeout, $waitFor, $mobile, $parsers, $actions, $location,
             $skipTlsVerification, $removeBase64Images, $blockAds, $proxy,
             $maxAge, $minAge, $storeInCache, $lockdown, $integration, $profile,
-            $changeTracking,
+            $changeTracking, $redactPII, $auditMetadata,
         );
     }
 
@@ -109,7 +115,10 @@ final class ScrapeOptions
             'timeout' => $this->timeout,
             'waitFor' => $this->waitFor,
             'mobile' => $this->mobile,
-            'parsers' => $this->parsers,
+            'parsers' => $this->parsers === null ? null : array_map(
+                fn (mixed $parser): mixed => $parser instanceof PDFParser ? $parser->toArray() : $parser,
+                $this->parsers,
+            ),
             'actions' => $this->actions,
             'location' => $this->location?->toArray(),
             'skipTlsVerification' => $this->skipTlsVerification,
@@ -123,6 +132,8 @@ final class ScrapeOptions
             'integration' => $this->integration,
             'profile' => $this->profile,
             'changeTracking' => $this->changeTracking,
+            'redactPII' => $this->redactPII,
+            'auditMetadata' => $this->auditMetadata?->toArray(),
         ];
 
         foreach ($fields as $key => $value) {
@@ -178,7 +189,12 @@ final class ScrapeOptions
         return $this->mobile;
     }
 
-    /** @return list<mixed>|null */
+    public function getRedactPII(): ?bool
+    {
+        return $this->redactPII;
+    }
+
+    /** @return list<string|PDFParser|array<string, mixed>>|null */
     public function getParsers(): ?array
     {
         return $this->parsers;
@@ -249,5 +265,10 @@ final class ScrapeOptions
     public function getChangeTracking(): ?bool
     {
         return $this->changeTracking;
+    }
+
+    public function getAuditMetadata(): ?AuditMetadata
+    {
+        return $this->auditMetadata;
     }
 }

@@ -3,6 +3,7 @@ import {
   describeIf,
   ALLOW_TEST_SUITE_WEBSITE,
   TEST_SELF_HOST,
+  TEST_SUITE_WEBSITE,
 } from "../lib";
 import {
   idmux,
@@ -30,6 +31,62 @@ describeIf(ALLOW_TEST_SUITE_WEBSITE && !TEST_SELF_HOST)("/v2/monitor", () => {
       credits: 1000000,
     });
   }, 10000);
+
+  it(
+    "reserves the known PDF page cost before a repeat monitor run",
+    async () => {
+      const create = await monitorCreateRaw(
+        {
+          name: "PDF reservation monitor",
+          schedule: { cron: "0 * * * *", timezone: "UTC" },
+          targets: [
+            {
+              type: "scrape",
+              urls: [
+                `${TEST_SUITE_WEBSITE}/example-long.pdf?testId=${crypto.randomUUID()}`,
+              ],
+              scrapeOptions: { formats: ["markdown"] },
+            },
+          ],
+          notification: { email: { enabled: false } },
+        },
+        identity,
+      );
+      expect(create.statusCode).toBe(200);
+      const monitorId = create.body.data.id;
+      const runToCompletion = async () => {
+        const run = await monitorRunRaw(monitorId, identity);
+        expect(run.statusCode).toBe(200);
+        let check: any;
+        for (let i = 0; i < 90; i++) {
+          const raw = await monitorCheckRaw(monitorId, run.body.id, identity);
+          expect(raw.statusCode).toBe(200);
+          check = raw.body.data;
+          if (
+            ["completed", "partial", "failed", "skipped_no_credits"].includes(
+              check.status,
+            )
+          )
+            break;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        expect(check.status).toBe("completed");
+        return check;
+      };
+      try {
+        const first = await runToCompletion();
+        expect(first.estimatedCredits).toBe(1);
+        expect(first.actualCredits).toBeGreaterThan(1);
+        const second = await runToCompletion();
+        expect(second.estimatedCredits).toBe(first.actualCredits);
+        expect(second.reservedCredits).toBe(first.actualCredits);
+        expect(second.actualCredits).toBe(first.actualCredits);
+      } finally {
+        await monitorDeleteRaw(monitorId, identity);
+      }
+    },
+    3 * scrapeTimeout,
+  );
 
   it("creates, lists, gets, pauses, and deletes a monitor", async () => {
     const create = await monitorCreateRaw(
@@ -245,6 +302,70 @@ describeIf(ALLOW_TEST_SUITE_WEBSITE && !TEST_SELF_HOST)("/v2/monitor", () => {
       // without a mutating fixture; a second run with a changed page would
       // be needed. The contract assertion is: when JSON mode is requested,
       // the monitor doesn't fall through the markdown path and crash.
+      expect(check.pages[0].status).toBe("new");
+
+      await monitorDeleteRaw(monitorId, identity);
+    },
+    2 * scrapeTimeout,
+  );
+
+  it(
+    "runs a deterministicJson-mode monitor target",
+    async () => {
+      const jsonSchema = {
+        type: "object",
+        additionalProperties: false,
+        required: ["title"],
+        properties: {
+          title: {
+            type: "string",
+            description: "The page title, verbatim.",
+          },
+        },
+      };
+
+      const create = await monitorCreateRaw(
+        {
+          name: "deterministic-json monitor",
+          schedule: { cron: "*/30 * * * *", timezone: "UTC" },
+          targets: [
+            {
+              type: "scrape",
+              urls: [createTestIdUrl()],
+              scrapeOptions: {
+                formats: [
+                  "markdown",
+                  {
+                    type: "deterministicJson",
+                    prompt: "Extract the page title verbatim.",
+                    schema: jsonSchema,
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        identity,
+      );
+      expect(create.statusCode).toBe(200);
+
+      const monitorId = create.body.data.id;
+      const run = await monitorRunRaw(monitorId, identity);
+      expect(run.statusCode).toBe(200);
+      const checkId = run.body.id;
+
+      let check: any;
+      for (let i = 0; i < 90; i++) {
+        const raw = await monitorCheckRaw(monitorId, checkId, identity);
+        expect(raw.statusCode).toBe(200);
+        check = raw.body.data;
+        if (["completed", "partial", "failed"].includes(check.status)) break;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      // Contract: deterministicJson is accepted, the reusable-json-mode extractor
+      // populates document.json via the code-sandbox, and the check flows through
+      // the JSON diff path (status "new" on first run) rather than crashing.
+      expect(["completed", "partial"]).toContain(check.status);
       expect(check.pages[0].status).toBe("new");
 
       await monitorDeleteRaw(monitorId, identity);

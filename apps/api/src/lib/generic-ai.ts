@@ -1,6 +1,6 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import { config } from "../config";
-import { createOllama } from "ollama-ai-provider";
+import { createOllama } from "ollama-ai-provider-v2";
 import { anthropic } from "@ai-sdk/anthropic";
 import { groq } from "@ai-sdk/groq";
 import { google } from "@ai-sdk/google";
@@ -8,6 +8,7 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { fireworks } from "@ai-sdk/fireworks";
 import { deepinfra } from "@ai-sdk/deepinfra";
 import { createVertex } from "@ai-sdk/google-vertex";
+import { withUsageTelemetry } from "./ai-usage-telemetry";
 
 type Provider =
   | "openai"
@@ -24,7 +25,7 @@ const defaultProvider: Provider = config.OLLAMA_BASE_URL ? "ollama" : "openai";
 const providerList: Record<Provider, any> = {
   openai: createOpenAI({
     apiKey: config.OPENAI_API_KEY,
-    baseURL: config.OPENAI_BASE_URL,
+    baseURL: config.OPENAI_BASE_URL || "https://api.openai.com/v1",
   }), //OPENAI_API_KEY
   ollama: createOllama({
     baseURL: config.OLLAMA_BASE_URL,
@@ -53,16 +54,22 @@ const providerList: Record<Provider, any> = {
   }),
 };
 
-export function getModel(name: string, provider: Provider = defaultProvider) {
+export function getModel(
+  name: string,
+  provider: Provider = defaultProvider,
+  options?: { ignoreModelOverride?: boolean },
+) {
   if (name === "gemini-2.5-pro") {
     name = "gemini-2.5-pro";
   }
-  const modelName = config.MODEL_NAME || name;
+  const modelName = options?.ignoreModelOverride
+    ? name
+    : config.MODEL_NAME || name;
   // o3-mini returns empty text via the Responses API — force Chat Completions
   if (provider === "openai" && modelName.startsWith("o3-mini")) {
-    return providerList.openai.chat(modelName);
+    return withUsageTelemetry(providerList.openai.chat(modelName));
   }
-  return providerList[provider](modelName);
+  return withUsageTelemetry(providerList[provider](modelName));
 }
 
 export function getEmbeddingModel(

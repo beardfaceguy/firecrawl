@@ -90,8 +90,11 @@ type ScrapeOptions struct {
 	MaxAge              *int64                   `json:"maxAge,omitempty"`
 	StoreInCache        *bool                    `json:"storeInCache,omitempty"`
 	Lockdown            *bool                    `json:"lockdown,omitempty"`
+	RedactPII           *bool                    `json:"redactPII,omitempty"`
+	AuditMetadata       *AuditMetadata           `json:"auditMetadata,omitempty"`
 	Integration         *string                  `json:"integration,omitempty"`
 	JsonOptions         *JsonOptions             `json:"jsonOptions,omitempty"`
+	DomainTools         *bool                    `json:"domainTools,omitempty"`
 }
 
 // MarshalJSON preserves string formats while allowing object formats such as QuestionFormat.
@@ -157,10 +160,12 @@ type MapOptions struct {
 	Timeout               *int            `json:"timeout,omitempty"`
 	Integration           *string         `json:"integration,omitempty"`
 	Location              *LocationConfig `json:"location,omitempty"`
+	AuditMetadata         *AuditMetadata  `json:"auditMetadata,omitempty"`
 }
 
 // SearchOptions configures a search request.
 type SearchOptions struct {
+	DomainTools       *bool          `json:"domainTools,omitempty"`
 	Sources           []interface{}  `json:"sources,omitempty"`
 	Categories        []interface{}  `json:"categories,omitempty"`
 	IncludeDomains    []string       `json:"includeDomains,omitempty"`
@@ -168,8 +173,10 @@ type SearchOptions struct {
 	Limit             *int           `json:"limit,omitempty"`
 	TBS               *string        `json:"tbs,omitempty"`
 	Location          *string        `json:"location,omitempty"`
+	Country           *string        `json:"country,omitempty"`
 	IgnoreInvalidURLs *bool          `json:"ignoreInvalidURLs,omitempty"`
 	Timeout           *int           `json:"timeout,omitempty"`
+	Highlights        *bool          `json:"highlights,omitempty"`
 	ScrapeOptions     *ScrapeOptions `json:"scrapeOptions,omitempty"`
 	Integration       *string        `json:"integration,omitempty"`
 }
@@ -183,7 +190,58 @@ type AgentOptions struct {
 	MaxCredits            *int                   `json:"maxCredits,omitempty"`
 	StrictConstrainToURLs *bool                  `json:"strictConstrainToURLs,omitempty"`
 	Model                 *string                `json:"model,omitempty"`
-	Webhook               *WebhookConfig         `json:"webhook,omitempty"`
+	// Effort sets the reasoning budget for the agent. Valid values are "low",
+	// "medium", and "high". Every effort level runs spark-2.
+	Effort        *string        `json:"effort,omitempty"`
+	Webhook       *WebhookConfig `json:"webhook,omitempty"`
+	AuditMetadata *AuditMetadata `json:"auditMetadata,omitempty"`
+	// ThreadID continues an existing thread as its next turn. Nil starts a new
+	// thread.
+	ThreadID *string `json:"threadId,omitempty"`
+	// Mode is "extract" or "chat".
+	Mode *string `json:"mode,omitempty"`
+	// Exchange lets the agent call Exchange data providers. Nil on a follow-up
+	// turn inherits the previous turn's settings.
+	Exchange *AgentExchangeOptions `json:"exchange,omitempty"`
+}
+
+// AgentExchangeOptions configures Exchange for an agent run. Every field is
+// optional and the server owns the defaults.
+type AgentExchangeOptions struct {
+	Enabled *bool `json:"enabled,omitempty"`
+	// Toolkits pins up to 5 provider slugs. An empty list means every provider
+	// the team can use; nil inherits the previous turn's pin.
+	Toolkits *[]string `json:"toolkits,omitempty"`
+	MaxCalls *int      `json:"maxCalls,omitempty"`
+	// RequireApproval ends the turn with a PendingApproval before a paid
+	// provider call. It needs Mode "chat" on the same request.
+	RequireApproval *bool `json:"requireApproval,omitempty"`
+	// Approve and Decline answer the previous turn's PendingApproval, so they
+	// need ThreadID.
+	Approve *AgentExchangeApprove `json:"approve,omitempty"`
+	Decline *AgentExchangeDecline `json:"decline,omitempty"`
+	// OnTermsRequired is "skip" or "ask".
+	OnTermsRequired *string `json:"onTermsRequired,omitempty"`
+}
+
+// AgentExchangeApprove approves a pending approval. CallIDs and Always are
+// ignored on a terms approval.
+type AgentExchangeApprove struct {
+	ApprovalID string `json:"approvalId"`
+	// CallIDs approves a subset of the pending calls. Nil approves all of
+	// them; an empty list approves none.
+	CallIDs *[]string `json:"callIds,omitempty"`
+	Always  *bool     `json:"always,omitempty"`
+}
+
+// AgentExchangeDecline declines a pending approval.
+type AgentExchangeDecline struct {
+	ApprovalID string `json:"approvalId"`
+}
+
+// AuditMetadata identifies the user associated with a SIEM logging event.
+type AuditMetadata struct {
+	Username string `json:"username"`
 }
 
 // LocationConfig specifies geolocation for requests.
@@ -202,8 +260,9 @@ type WebhookConfig struct {
 
 // JsonOptions configures JSON extraction within formats.
 type JsonOptions struct {
-	Prompt string                 `json:"prompt,omitempty"`
-	Schema map[string]interface{} `json:"schema,omitempty"`
+	Prompt               string                 `json:"prompt,omitempty"`
+	Schema               map[string]interface{} `json:"schema,omitempty"`
+	CheckPromptInjection *bool                  `json:"checkPromptInjection,omitempty"`
 }
 
 // Pointer helpers for optional fields.

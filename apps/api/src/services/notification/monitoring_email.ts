@@ -1,8 +1,10 @@
 import { Resend } from "resend";
 import escapeHtml from "escape-html";
+import { eq } from "drizzle-orm";
 import { config } from "../../config";
 import { logger as _logger } from "../../lib/logger";
-import { supabase_service } from "../supabase";
+import { dbRr } from "../../db/connection";
+import * as schema from "../../db/schema";
 import type { MonitorCheckRow, MonitorRow } from "../monitoring/types";
 import {
   ensureMonitorEmailRecipient,
@@ -88,31 +90,39 @@ export type MonitoringEmailPayload = {
 };
 
 async function getTeamEmails(teamId: string): Promise<string[]> {
-  const { data, error } = await supabase_service
-    .from("user_teams")
-    .select(
-      "users(email, id, notification_preferences(unsubscribed_all, email_preferences))",
-    )
-    .eq("team_id", teamId);
-
-  if (error) {
+  let rows: {
+    email: string | null;
+    unsubscribed_all: boolean | null;
+    email_preferences: string[] | null;
+  }[];
+  try {
+    rows = await dbRr
+      .select({
+        email: schema.users.email,
+        unsubscribed_all: schema.notification_preferences.unsubscribed_all,
+        email_preferences: schema.notification_preferences.email_preferences,
+      })
+      .from(schema.user_teams)
+      .innerJoin(schema.users, eq(schema.user_teams.user_id, schema.users.id))
+      .leftJoin(
+        schema.notification_preferences,
+        eq(schema.notification_preferences.user_id, schema.users.id),
+      )
+      .where(eq(schema.user_teams.team_id, teamId));
+  } catch (error) {
     logger.warn("Failed to load team emails", { error, teamId });
     return [];
   }
 
   const emails = new Set<string>();
-  for (const row of data ?? []) {
-    const user = (row as any).users;
-    const email = user?.email;
+  for (const row of rows) {
+    const email = row.email;
     if (!email) continue;
 
-    const prefs = Array.isArray(user.notification_preferences)
-      ? user.notification_preferences[0]
-      : user.notification_preferences;
-    if (prefs?.unsubscribed_all) continue;
+    if (row.unsubscribed_all) continue;
     if (
-      Array.isArray(prefs?.email_preferences) &&
-      !prefs.email_preferences.includes("system_alerts")
+      Array.isArray(row.email_preferences) &&
+      !row.email_preferences.includes("system_alerts")
     ) {
       continue;
     }
@@ -266,13 +276,10 @@ export async function sendMonitoringConfirmationEmail(params: {
 }): Promise<{ attempted: boolean; success: boolean; error?: string }> {
   const resend = getResendClient();
   if (!resend) {
-    logger.warn(
-      "Skipping monitor opt-in email; RESEND_API_KEY is not set",
-      {
-        monitorId: params.recipient.monitor_id,
-        recipientId: params.recipient.id,
-      },
-    );
+    logger.warn("Skipping monitor opt-in email; RESEND_API_KEY is not set", {
+      monitorId: params.recipient.monitor_id,
+      recipientId: params.recipient.id,
+    });
     return { attempted: false, success: true };
   }
 
@@ -366,10 +373,13 @@ async function resolveSendableRecipients(
         }),
       );
       rows = legacyRows;
-      logger.info("Bootstrapped legacy monitor recipients without DB backfill", {
-        monitorId: monitor.id,
-        recipients: explicitConfigured,
-      });
+      logger.info(
+        "Bootstrapped legacy monitor recipients without DB backfill",
+        {
+          monitorId: monitor.id,
+          recipients: explicitConfigured,
+        },
+      );
     }
 
     const rowsByEmail = new Map(rows.map(r => [r.email, r]));
@@ -475,9 +485,13 @@ export async function sendMonitoringEmailSummary(params: {
   // complete (a missed meaningful alert is worse than a noisy one).
   if (params.monitor.judge_enabled && params.monitor.goal) {
     const changedPages = params.pages.filter(p => p.status === "changed");
-    const nonChangedActivity = params.pages.some(
-      p => p.status === "new" || p.status === "removed" || p.status === "error",
-    );
+    // Use the authoritative check counters (aggregated over ALL pages), not the
+    // page list — the runner caps `pages` at 100, so scanning it can miss
+    // new/removed/error activity beyond the cap and wrongly suppress the email.
+    const nonChangedActivity =
+      params.check.new_count > 0 ||
+      params.check.removed_count > 0 ||
+      params.check.error_count > 0;
     const changedListComplete =
       changedPages.length >= params.check.changed_count;
     if (changedPages.length > 0 && !nonChangedActivity && changedListComplete) {
@@ -514,16 +528,13 @@ export async function sendMonitoringEmailSummary(params: {
 
   const resolved = await resolveSendableRecipients(params.monitor);
   if (resolved.confirmedRecipients.length === 0) {
-    logger.info(
-      "Skipping monitoring email summary; no confirmed recipients",
-      {
-        monitorId: params.monitor.id,
-        checkId: params.check.id,
-        configured: resolved.total,
-        pending: resolved.pending,
-        unsubscribed: resolved.unsubscribed,
-      },
-    );
+    logger.info("Skipping monitoring email summary; no confirmed recipients", {
+      monitorId: params.monitor.id,
+      checkId: params.check.id,
+      configured: resolved.total,
+      pending: resolved.pending,
+      unsubscribed: resolved.unsubscribed,
+    });
     return {
       attempted: false,
       success: true,
@@ -589,8 +600,7 @@ export async function sendMonitoringEmailSummary(params: {
           return {
             recipient,
             success: false,
-            error:
-              typeof error === "string" ? error : JSON.stringify(error),
+            error: typeof error === "string" ? error : JSON.stringify(error),
           };
         }
         return { recipient, success: true };

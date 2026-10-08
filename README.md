@@ -1,3 +1,77 @@
+# Knowledge graph candidate output (this fork)
+
+> **Experimental fork addition, not part of hosted Firecrawl:** `knowledgeGraph` turns a scraped page into candidate entities and directed relationships. These are **unverified leads**, not a fact-checked knowledge base. Before using an edge as a fact, read the source page. This fork also has a companion [MCP server branch](https://github.com/beardfaceguy/firecrawl-mcp-server/tree/kg-upstream-refresh).
+
+## What's added
+
+- Opt-in `knowledgeGraph` format for scrape and crawl; full-surface search can scrape per-result graphs and returns a merged top-level graph. `knowledgeGraphOptions.entityTypes` in the MCP tool (or `entityTypes` on the API format object) limits node types to at most 50 names.
+- KG-specific `KG_MODEL` and `KG_RETRY_MODEL` environment variables. Defaults remain `gpt-4o-mini` and `gpt-4.1-mini` on OpenAI. The global `MODEL_NAME` does not override KG model selection.
+- Basic graph-integrity checks and a narrow Wikipedia-style `Parents` infobox correction. **This is not a general wiki template or factual verifier**; aliases and other relationships can still be wrong.
+
+## Example graph and browser viewer
+
+The [Ada Lovelace candidate graph](examples/kg-generator/ada-lovelace-gpt-5.json) was generated from the [Wikipedia article](https://en.wikipedia.org/wiki/Ada_Lovelace) with `gpt-5` at its provider-default reasoning setting. It contains 52 nodes and 54 edges; those relationships are **not fact-verified**.
+
+To explore it, clone this branch, open the bundled [KG browser viewer](examples/kg-generator/firecrawl-kg-browser-viewer/index.html) as a local HTML file, choose `examples/kg-generator/ada-lovelace-gpt-5.json`, and click **Show graph**. The viewer includes Cytoscape.js locally and does not upload the JSON. GitHub shows the HTML source; open the downloaded file in your browser to use the viewer.
+
+## Install and run locally
+
+Requires Docker with Compose, enough resources to build/run the API and Playwright, and an OpenAI key with access to the selected model. Use this branch, not this fork's older default branch:
+
+```sh
+git clone https://github.com/beardfaceguy/firecrawl.git
+cd firecrawl
+git switch kg-upstream-refresh
+cat > .env <<'ENV'
+PORT=127.0.0.1:3002
+INTERNAL_PORT=3002
+USE_DB_AUTHENTICATION=false
+NUQ_BACKEND=pg
+NUM_WORKERS_PER_QUEUE=1
+CRAWL_CONCURRENT_REQUESTS=2
+MAX_CONCURRENT_JOBS=2
+BROWSER_POOL_SIZE=1
+KG_MODEL=gpt-4o-mini
+KG_RETRY_MODEL=gpt-4.1-mini
+ENV
+chmod 600 .env
+# Edit .env and add OPENAI_API_KEY=... locally; never commit or paste the key.
+docker compose up -d --build redis rabbitmq nuq-postgres playwright-service api
+curl http://127.0.0.1:3002/
+```
+
+`.env` is Git-ignored. The example binds the unauthenticated local API to loopback **only**; do not expose it publicly with `USE_DB_AUTHENTICATION=false`. Stop it with `docker compose down`. [API environment examples](apps/api/.env.example) cover additional services and production-style configuration.
+
+## Request a candidate graph
+
+The unauthenticated local API does not require an API bearer token. Request `markdown` alongside the graph when you want to inspect its source text:
+
+```sh
+curl -sS http://127.0.0.1:3002/v2/scrape \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","formats":["markdown",{"type":"knowledgeGraph","entityTypes":["Organization","Concept"]}]}'
+```
+
+For search, pass `"scrapeOptions":{"formats":["knowledgeGraph"]}` to `POST /v2/search`; each scraped result may carry a graph and `data.knowledgeGraph` is the merged graph. For crawl, pass the same `scrapeOptions` to `POST /v2/crawl`, then poll `GET /v2/crawl/{id}` for per-page graphs. Search results depend on an available search provider; an empty result set cannot produce a merged graph. Standard hosted Firecrawl may reject this fork-only format.
+
+To use the companion MCP fork, build its [`kg-upstream-refresh` branch](https://github.com/beardfaceguy/firecrawl-mcp-server/tree/kg-upstream-refresh) with `corepack pnpm install --frozen-lockfile && corepack pnpm build`. Configure your MCP client to launch its `dist/index.js` with `FIRECRAWL_API_URL=http://127.0.0.1:3002`, `CLOUD_SERVICE=false`, and a non-secret placeholder `FIRECRAWL_API_KEY` while local API authentication is disabled. The MCP scrape tool accepts `formats: ["knowledgeGraph"]` and optional `knowledgeGraphOptions: { "entityTypes": ["Person"] }`.
+
+## Quality, model trials, and next steps
+
+The output is a **candidate graph for discovery**: use nodes and edges to find leads, then check important relationships against the page. There is no edge-level citation, source passage, confidence score, reusable site template, or guarantee of factual correctness today. A proposed phase 2 would ground each edge in source evidence, validate high-impact claims, and evaluate a diverse human-checked corpus before scaling. OpenRouter provider support is a possible later extension, not currently enabled for KG.
+
+In an exploratory trial, each model was run **once** on each of the Ada Lovelace and Marie Curie Wikipedia pages. Times include scraping; the pages were fetched fresh rather than held byte-identical. The infobox correction was active for all models, so correct parent edges alone do not measure raw model quality.
+
+| KG primary model | Ada / Marie end-to-end | Notable inspected relationship labels |
+| --- | --- | --- |
+| `gpt-4o-mini` (current default) | 10.8s / 11.8s | Reversed some child/sibling and named-after relations on Ada. |
+| `gpt-4.1` | 32.4s / 14.1s | Family labels improved, but named-after and advisor/student labels had errors or ambiguity. |
+| `gpt-5` | 86.3s / 131.7s | Inspected direction labels were more coherent; substantially slower. |
+
+This is **not** a statistically valid model ranking or a full factual audit. Exact per-request token costs were not available from the self-hosted logs. The original default was restored after the trial; change `KG_MODEL` in `.env` and recreate the API container to run your own comparison. For a credible evaluation, snapshot source pages, annotate expected edges and evidence, repeat model runs, and measure both unsupported-edge and missed-edge rates.
+
+---
+
 <h3 align="center">
   <a name="readme-top"></a>
   <img
@@ -39,7 +113,7 @@
 
 # **🔥 Firecrawl**
 
-**The API to search, scrape, and interact with the web at scale. 🔥** The web context API to find sources, extract content, and turn it into clean Markdown or structured data your agents can ship with. Open source and available as a [hosted service](https://firecrawl.dev/?ref=github).
+**Supercharge your AI agents with data from the web and beyond. Building the library for superintelligence. 🔥** Open source and available as a [hosted service](https://firecrawl.dev/?ref=github).
 
 _Pst. Hey, you, join our stargazers :)_
 
@@ -58,7 +132,7 @@ _Pst. Hey, you, join our stargazers :)_
 - **Agent ready**: Connect Firecrawl to any AI agent or MCP client with a single command
 - **Media parsing**: Parse and extract content from web-hosted PDFs, DOCX, and more
 - **Actions**: Click, scroll, write, wait, and press before extracting content
-- **Open source**: Developed transparently and collaboratively — [join our community](https://github.com/firecrawl/firecrawl)
+- **Open source**: Developed transparently and collaboratively — [join our community](https://discord.gg/firecrawl)
 
 ---
 
@@ -189,7 +263,7 @@ Output:
 ```
 # Firecrawl
 
-Firecrawl helps AI systems search, scrape, and interact with the web.
+Firecrawl helps AI agents search, scrape, and interact with the web.
 
 ## Features
 - Search: Find information across the web
@@ -382,27 +456,31 @@ result = app.agent(
 )
 ```
 
-#### Model Selection
+#### Effort Selection
 
-Choose between two models based on your needs:
+Set how much reasoning the agent spends on the task:
 
-| Model | Cost | Best For |
-|-------|------|----------|
-| `spark-1-mini` (default) | 60% cheaper | Most tasks |
-| `spark-1-pro` | Standard | Complex research, critical data gathering |
+| Effort | Best For |
+|--------|----------|
+| `low` | Simple lookups on one site |
+| `medium` | Multi-step tasks on a few pages |
+| `high` | Deep research, complex navigation, critical data |
+
 ```python
 result = app.agent(
     prompt="Compare enterprise features across Firecrawl, Apify, and ScrapingBee",
-    model="spark-1-pro"
+    effort="high"
 )
 ```
 
+Every effort level runs the `spark-2` model. Effort changes the reasoning
+budget, not the model.
 
-**When to use Pro:**
-- Comparing data across multiple websites
-- Extracting from sites with complex navigation or auth
-- Research tasks where the agent needs to explore multiple paths
-- Critical data where accuracy is paramount
+#### Model
+
+Every agent run executes on `spark-2`, the default, so you don't need to set
+`model`. The retired `spark-1-pro` and `spark-1-mini` names are still accepted
+for backwards compatibility, but they are deprecated and run `spark-2`.
 
 Learn more about Spark models in our [Agent documentation](https://docs.firecrawl.dev/features/agent).
 
@@ -572,6 +650,71 @@ results.data.web.forEach(result => {
 });
 ```
 
+### Go
+
+Install the SDK:
+```bash
+go get github.com/firecrawl/firecrawl/apps/go-sdk
+```
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	firecrawl "github.com/firecrawl/firecrawl/apps/go-sdk"
+	"github.com/firecrawl/firecrawl/apps/go-sdk/option"
+)
+
+func main() {
+	// Create a client (reads FIRECRAWL_API_KEY from environment)
+	client, err := firecrawl.NewClient(option.WithAPIKey("fc-YOUR_API_KEY"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Scrape a single URL
+	doc, err := client.Scrape(ctx, "https://firecrawl.dev", &firecrawl.ScrapeOptions{
+		Formats: []string{"markdown"},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(doc.Markdown)
+
+	// Use the Agent for autonomous data gathering
+	agent, err := client.Agent(ctx, &firecrawl.AgentOptions{
+		Prompt: "Find the founders of Stripe",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(agent.Data)
+
+	// Crawl a website (automatically waits for completion)
+	job, err := client.Crawl(ctx, "https://docs.firecrawl.dev", &firecrawl.CrawlOptions{
+		Limit: firecrawl.Int(50),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Crawled %d pages\n", len(job.Data))
+
+	// Search the web
+	results, err := client.Search(ctx, "best AI data tools 2024", &firecrawl.SearchOptions{
+		Limit: firecrawl.Int(10),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(results)
+}
+```
+
 ### Java
 
 Add the dependency ([Gradle/Maven](https://docs.firecrawl.dev/sdks/java#installation)):
@@ -690,19 +833,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Community SDKs
+### Ruby
 
-- [Go SDK](https://github.com/firecrawl/firecrawl/tree/main/apps/go-sdk)
+Install the SDK:
+```bash
+gem install firecrawl-sdk
+```
+```ruby
+require "firecrawl"
+
+client = Firecrawl::Client.new(api_key: "fc-YOUR_API_KEY")
+
+# Scrape a single URL
+doc = client.scrape("https://firecrawl.dev",
+  Firecrawl::Models::ScrapeOptions.new(formats: ["markdown"]))
+puts doc.markdown
+
+# Use the Agent for autonomous data gathering
+result = client.agent(
+  Firecrawl::Models::AgentOptions.new(prompt: "Find the founders of Stripe"))
+puts result.data
+
+# Crawl a website (automatically waits for completion)
+job = client.crawl("https://docs.firecrawl.dev",
+  Firecrawl::Models::CrawlOptions.new(limit: 50))
+job.data.each { |d| puts d.metadata.source_url }
+
+# Search the web
+results = client.search("best AI data tools 2024",
+  Firecrawl::Models::SearchOptions.new(limit: 10))
+puts results
+```
+
+### .NET
+
+Install the SDK:
+```bash
+dotnet add package firecrawl-sdk
+```
+```csharp
+using Firecrawl;
+using Firecrawl.Models;
+
+var client = new FirecrawlClient("fc-YOUR_API_KEY");
+
+// Scrape a single URL
+var doc = await client.ScrapeAsync("https://firecrawl.dev",
+    new ScrapeOptions { Formats = new List<object> { "markdown" } });
+Console.WriteLine(doc.Markdown);
+
+// Crawl a website (automatically waits for completion)
+var job = await client.CrawlAsync("https://docs.firecrawl.dev",
+    new CrawlOptions { Limit = 50 });
+Console.WriteLine($"Crawled {job.Data.Count} pages");
+
+// Search the web
+var results = await client.SearchAsync("best AI data tools 2024",
+    new SearchOptions { Limit = 10 });
+Console.WriteLine(results);
+```
+
+### PHP
+
+Install the SDK:
+```bash
+composer require firecrawl/firecrawl-sdk
+```
+```php
+<?php
+
+use Firecrawl\Client\FirecrawlClient;
+use Firecrawl\Models\ScrapeOptions;
+use Firecrawl\Models\CrawlOptions;
+use Firecrawl\Models\SearchOptions;
+
+$client = FirecrawlClient::create(apiKey: 'fc-YOUR_API_KEY');
+
+// Scrape a single URL
+$doc = $client->scrape('https://firecrawl.dev', ScrapeOptions::with(
+    formats: ['markdown'],
+));
+echo $doc->getMarkdown();
+
+// Crawl a website (automatically waits for completion)
+$job = $client->crawl('https://docs.firecrawl.dev', CrawlOptions::with(limit: 50));
+foreach ($job->getData() as $page) {
+    echo $page->getMetadata()['sourceURL'] . "\n";
+}
+
+// Search the web
+$results = $client->search('best AI data tools 2024', SearchOptions::with(limit: 10));
+print_r($results);
+```
 
 ---
 
 ## Integrations
 
 **Agents & AI Tools**
-- [Firecrawl Skill](https://docs.firecrawl.dev/sdks/cli)
-- [Firecrawl CLI Skills](https://github.com/firecrawl/cli#agent-skills)
-- [Firecrawl Workflows](https://github.com/firecrawl/firecrawl-workflows)
+- [Firecrawl Skills Catalog](https://github.com/firecrawl/skills) — install with `npx skills add firecrawl/skills`
+- [Firecrawl CLI](https://docs.firecrawl.dev/sdks/cli)
 - [Firecrawl MCP](https://github.com/mendableai/firecrawl-mcp-server)
+
+The build skills (integrating Firecrawl into product code) are authored in this repo under [`skills/`](./skills) and mirrored into the catalog by CI. Contributing skills? CLI skills (including the research/developer index skills) → PR [`firecrawl/cli`](https://github.com/firecrawl/cli). Build/SDK skills → PR this repo (`skills/`). Workflow skills → PR [`firecrawl/firecrawl-workflows`](https://github.com/firecrawl/firecrawl-workflows). The catalog ([`firecrawl/skills`](https://github.com/firecrawl/skills)) is read-only — never PR it directly.
 
 **Platforms**
 - [Lovable](https://docs.lovable.dev/integrations/firecrawl)

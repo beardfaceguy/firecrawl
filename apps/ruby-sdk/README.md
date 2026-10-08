@@ -74,11 +74,40 @@ doc = client.scrape("https://www.youtube.com/watch?v=dQw4w9WgXcQ",
 puts doc.video
 ```
 
+### Product Extraction
+
+Use the `product` format on product pages to get structured product data
+(title, brand, category, and per-variant price, availability, and images).
+It is the deterministic counterpart to the LLM-based `json` format. The
+returned `product` field contains the extracted fields.
+
+```ruby
+doc = client.scrape("https://example.com/products/widget",
+  Firecrawl::Models::ScrapeOptions.new(formats: ["product"]))
+
+puts doc.product
+```
+
+### Menu Extraction
+
+Use the `menu` format on restaurant/merchant menu pages to get structured
+menu data (merchant profile plus ordered sections, each holding items with
+per-item price, availability, images, and dietary information). It is the
+deterministic counterpart to the LLM-based `json` format. The returned `menu`
+field contains the extracted fields.
+
+```ruby
+doc = client.scrape("https://example.com/menu",
+  Firecrawl::Models::ScrapeOptions.new(formats: ["menu"]))
+
+puts doc.menu
+```
+
 ### Parse
 
 Upload a local file (`html`, `pdf`, `docx`, etc.) via multipart form data and
 parse it synchronously. Parse options intentionally exclude browser-only
-features such as change tracking, screenshot, branding, audio, video, actions,
+features such as change tracking, screenshot, branding, audio, video, product, actions,
 wait_for, location, and mobile. The `proxy` option only accepts `"auto"` or `"basic"`.
 
 ```ruby
@@ -95,6 +124,15 @@ file = Firecrawl::Models::ParseFile.new(
 doc = client.parse(file,
   Firecrawl::Models::ParseOptions.new(formats: ["markdown"]))
 puts doc.markdown
+```
+
+List the file formats the parse endpoint accepts. `available` is `false` for
+formats the deployment can't currently handle (e.g. images when OCR is off).
+
+```ruby
+client.get_parse_formats.each do |f|
+  puts "#{f.format} (#{f.kind}) #{f.extensions.join(", ")} #{f.mime_types.join(", ")} available=#{f.available}"
+end
 ```
 
 ### Crawl
@@ -165,6 +203,17 @@ status = client.agent(
     urls: ["https://example.com"]
   ))
 puts status.data
+
+# Use Alexandria data providers connected in the dashboard
+status = client.agent(
+  Firecrawl::Models::AgentOptions.new(
+    prompt: "Find the work email of the CEO of example.com",
+    exchange: Firecrawl::Models::AgentExchangeOptions.new(
+      enabled: true,
+      toolkits: ["apollo"]
+    )
+  ))
+puts status.exchange&.paid_calls
 ```
 
 ### Usage & Metrics
